@@ -50,6 +50,9 @@ func AddWebSocketSupport(s *Server, base http.Handler) http.Handler {
 			log.Printf("websocket.Accept: %v", err)
 			return
 		}
+		// DERP packets can be up to 64 KiB, plus DERP framing. The
+		// websocket package's 32 KiB default would reject valid packets.
+		c.SetReadLimit(1 << 20)
 		defer c.Close(websocket.StatusInternalError, "closing")
 		if c.Subprotocol() != "derp" {
 			c.Close(websocket.StatusPolicyViolation, "client must speak the derp subprotocol")

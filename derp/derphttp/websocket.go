@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build js || ((linux || darwin) && ts_debug_websockets)
+//go:build js || linux || (darwin && ts_debug_websockets)
 
 package derphttp
 
@@ -28,6 +28,9 @@ func dialWebsocket(ctx context.Context, urlStr string) (net.Conn, error) {
 		log.Printf("websocket Dial: %v, %+v", err, res)
 		return nil, err
 	}
+	// DERP packets can be up to 64 KiB, plus DERP framing. The
+	// websocket package's 32 KiB default would reject valid packets.
+	c.SetReadLimit(1 << 20)
 	log.Printf("websocket: connected to %v", urlStr)
 	netConn := wsconn.NetConn(context.Background(), c, websocket.MessageBinary, urlStr)
 	return netConn, nil

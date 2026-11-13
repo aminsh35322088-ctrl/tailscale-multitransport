@@ -251,6 +251,10 @@ func urlPort(u *url.URL) string {
 // 3340 instead of HTTPS on 443.
 var debugUseDERPHTTP = envknob.RegisterBool("TS_DEBUG_USE_DERP_HTTP")
 
+// useDERPWebSockets enables DERP-over-WebSocket for supported builds.
+// It is opt-in so existing deployments retain the native DERP transport.
+var useDERPWebSockets = envknob.RegisterBool("TS_DERP_USE_WEBSOCKETS")
+
 func (c *Client) targetString(reg *tailcfg.DERPRegion) string {
 	if c.url != nil {
 		return c.url.String()
@@ -331,7 +335,7 @@ func useWebsockets() bool {
 		return true
 	}
 	if dialWebsocketFunc != nil {
-		return envknob.Bool("TS_DEBUG_DERP_WS_CLIENT")
+		return useDERPWebSockets() || envknob.Bool("TS_DEBUG_DERP_WS_CLIENT")
 	}
 	return false
 }
@@ -399,48 +403,49 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 
 	var node *tailcfg.DERPNode // nil when using c.url to dial
 	var idealNodeInRegion bool
-	switch {
-	case canWebsockets && useWebsockets():
+	if canWebsockets && useWebsockets() {
 		var urlStr string
 		if c.url != nil {
 			urlStr = c.url.String()
-		} else {
+		} else if len(reg.Nodes) > 0 {
 			urlStr = c.urlString(reg.Nodes[0])
 		}
-		c.logf("%s: connecting websocket to %v", caller, urlStr)
-		conn, err := dialWebsocketFunc(ctx, urlStr)
-		if err != nil {
-			c.logf("%s: websocket to %v error: %v", caller, urlStr, err)
-			return nil, 0, err
-		}
-		brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-		derpClient, err := derp.NewClient(c.privateKey, conn, brw, c.logf,
-			derp.MeshKey(c.MeshKey),
-			derp.CanAckPings(c.canAckPings),
-			derp.IsProber(c.IsProber),
-			derp.AppName(c.AppName),
-		)
-		if err != nil {
-			return nil, 0, err
-		}
-		if c.preferred {
-			if err := derpClient.NotePreferred(true); err != nil {
+		if urlStr != "" {
+			c.logf("%s: connecting websocket to %v", caller, urlStr)
+			conn, wsErr := dialWebsocketFunc(ctx, urlStr)
+			if wsErr == nil {
+				brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+				derpClient, clientErr := derp.NewClient(c.privateKey, conn, brw, c.logf,
+					derp.MeshKey(c.MeshKey),
+					derp.CanAckPings(c.canAckPings),
+					derp.IsProber(c.IsProber),
+					derp.AppName(c.AppName),
+				)
+				if clientErr == nil && c.preferred {
+					clientErr = derpClient.NotePreferred(true)
+				}
+				if clientErr == nil {
+					c.serverPubKey = derpClient.ServerPublicKey()
+					c.client = derpClient
+					c.netConn = conn
+					c.connGen++
+					return c.client, c.connGen, nil
+				}
+				c.logf("%s: websocket DERP setup to %v failed; falling back to native DERP: %v", caller, urlStr, clientErr)
 				go conn.Close()
-				return nil, 0, err
+			} else {
+				c.logf("%s: websocket to %v failed; falling back to native DERP: %v", caller, urlStr, wsErr)
 			}
 		}
-		c.serverPubKey = derpClient.ServerPublicKey()
-		c.client = derpClient
-		c.netConn = conn
-		c.connGen++
-		return c.client, c.connGen, nil
+	}
+	switch {
 	case c.url != nil:
 		c.logf("%s: connecting to %v", caller, c.url)
 		tcpConn, err = c.dialURL(ctx)
 	default:
 		c.logf("%s: connecting to derp-%d (%v)", caller, reg.RegionID, reg.RegionCode)
 		tcpConn, node, err = c.dialRegion(ctx, reg)
-		idealNodeInRegion = err == nil && reg.Nodes[0] == node
+		idealNodeInRegion = err == nil && len(reg.Nodes) > 0 && reg.Nodes[0] == node
 	}
 	if err != nil {
 		return nil, 0, err
