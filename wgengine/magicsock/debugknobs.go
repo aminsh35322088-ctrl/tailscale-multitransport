@@ -40,6 +40,10 @@ var (
 	// debugDERPUseHTTP tells clients to connect to DERP via HTTP on port 3340 instead of
 	// HTTPS on 443.
 	debugUseDERPHTTP = envknob.RegisterBool("TS_DEBUG_USE_DERP_HTTP")
+	// debugDERPCloudflareLocalAddr redirects DERP TCP dials to a local
+	// cloudflared access tcp listener. Use with TS_DEBUG_USE_DERP_ADDR and
+	// TS_DEBUG_USE_DERP_HTTP for the Cloudflare DERP experiment.
+	debugDERPCloudflareLocalAddr = envknob.RegisterString("TS_DEBUG_DERP_CLOUDFLARE_LOCAL_ADDR")
 	// debugEnableSilentDisco disables the use of heartbeatTimer on the endpoint struct
 	// and attempts to handle disco silently. See issue #540 for details.
 	debugEnableSilentDisco = envknob.RegisterBool("TS_DEBUG_ENABLE_SILENT_DISCO")
