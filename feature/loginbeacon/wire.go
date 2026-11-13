@@ -74,6 +74,9 @@ var (
 
 func parseHeader(buf []byte) (msgType, requestID, error) {
 	var rid requestID
+	if len(buf) > maxWireSize {
+		return 0, rid, errBadLength
+	}
 	if len(buf) < headerSize {
 		return 0, rid, errShortHeader
 	}
@@ -131,9 +134,12 @@ func marshalBeacon(m *beaconMsg) ([]byte, error) {
 }
 
 func parseBeacon(buf []byte) (*beaconMsg, error) {
-	_, rid, err := parseHeader(buf)
+	t, rid, err := parseHeader(buf)
 	if err != nil {
 		return nil, err
+	}
+	if t != msgTypeBeacon {
+		return nil, errBadType
 	}
 	if len(buf) < headerSize+32+8+1+1+16 {
 		return nil, errBadLength
@@ -190,9 +196,12 @@ func marshalApproval(m *approvalMsg) []byte {
 }
 
 func parseApproval(buf []byte) (*approvalMsg, error) {
-	_, rid, err := parseHeader(buf)
+	t, rid, err := parseHeader(buf)
 	if err != nil {
 		return nil, err
+	}
+	if t != msgTypeApproval {
+		return nil, errBadType
 	}
 	const fixed = headerSize + 32 + 8 + 1
 	if len(buf) < fixed {
@@ -228,9 +237,12 @@ func marshalSealedURL(m *sealedURLMsg) ([]byte, error) {
 }
 
 func parseSealedURL(buf []byte) (*sealedURLMsg, error) {
-	_, rid, err := parseHeader(buf)
+	t, rid, err := parseHeader(buf)
 	if err != nil {
 		return nil, err
+	}
+	if t != msgTypeSealedURL {
+		return nil, errBadType
 	}
 	if len(buf) < headerSize+12 {
 		return nil, errBadLength

@@ -23,13 +23,11 @@ func TestSenderReceiverLocal(t *testing.T) {
 	logf := func(format string, args ...any) { t.Logf(format, args...) }
 
 	beacons := make(chan Beacon, 1)
-	urls := make(chan string, 1)
 
 	rctx, rcancel := context.WithCancel(context.Background())
 	defer rcancel()
 	r, err := StartReceiver(rctx, ReceiverConfig{
 		OnBeacon:   func(b Beacon) { beacons <- b },
-		OnAuthURL:  func(u string) { urls <- u },
 		URLAllowed: func(string) bool { return true },
 		Logf:       logf,
 	})
@@ -67,20 +65,17 @@ func TestSenderReceiverLocal(t *testing.T) {
 		t.Fatalf("Hostname = %q; want test-appliance", b.Hostname)
 	}
 
-	if err := r.Approve(b.RequestID); err != nil {
+	gotURL, err := r.Approve(t.Context(), b.RequestID)
+	if err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
-	select {
-	case gotURL := <-urls:
-		if gotURL != wantURL {
-			t.Fatalf("url = %q; want %q", gotURL, wantURL)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("did not receive decrypted URL within 5s")
+	if gotURL != wantURL {
+		t.Fatalf("url = %q; want %q", gotURL, wantURL)
 	}
+
 }
 
-func TestIgnoreSuppressesSubsequentBeacons(t *testing.T) {
+func TestDeleteSuppressesSubsequentBeacons(t *testing.T) {
 	logf := func(format string, args ...any) { t.Logf(format, args...) }
 
 	beacons := make(chan Beacon, 4)
@@ -89,7 +84,6 @@ func TestIgnoreSuppressesSubsequentBeacons(t *testing.T) {
 	defer rcancel()
 	r, err := StartReceiver(rctx, ReceiverConfig{
 		OnBeacon:   func(b Beacon) { beacons <- b },
-		OnAuthURL:  func(string) {},
 		URLAllowed: func(string) bool { return true },
 		Logf:       logf,
 	})
@@ -114,7 +108,7 @@ func TestIgnoreSuppressesSubsequentBeacons(t *testing.T) {
 
 	select {
 	case b := <-beacons:
-		r.Ignore(b.RequestID)
+		r.Delete(b.RequestID)
 	case <-time.After(15 * time.Second):
 		t.Fatal("no beacon observed")
 	}
@@ -122,23 +116,7 @@ func TestIgnoreSuppressesSubsequentBeacons(t *testing.T) {
 	// should fire for the same session.
 	select {
 	case b := <-beacons:
-		t.Fatalf("received duplicate beacon after Ignore: %+v", b)
+		t.Fatalf("received duplicate beacon after Delete: %+v", b)
 	case <-time.After(2 * beaconInterval):
-	}
-}
-
-func TestDefaultURLAllowed(t *testing.T) {
-	cases := map[string]bool{
-		"https://login.tailscale.com/x":  true,
-		"https://foo.tailscale.com/y":    true,
-		"http://login.tailscale.com/x":   false,
-		"https://evil.example.com/x":     false,
-		"https://tailscale.com.evil.com": false,
-		"":                               false,
-	}
-	for u, want := range cases {
-		if got := DefaultURLAllowed(u); got != want {
-			t.Errorf("DefaultURLAllowed(%q) = %v; want %v", u, got, want)
-		}
 	}
 }

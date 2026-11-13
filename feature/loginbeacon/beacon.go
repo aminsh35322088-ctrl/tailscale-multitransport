@@ -4,7 +4,7 @@
 //go:build !ts_omit_loginbeacon
 
 // Package loginbeacon lets a Tailscale device with a pending browseToURL
-// hand that URL off to any already-authenticated node on the same LAN.
+// hand that URL off to an approving node on the same LAN.
 // It multicasts a beacon carrying an ephemeral X25519 public key; an
 // approving node responds with its own ephemeral key; the requester seals
 // its auth URL to the approver, who opens it and drives the normal sign-in
@@ -12,7 +12,9 @@
 // smallest headless appliance and the approver is any node whose client
 // implements the protocol.
 //
-// Wire format, discovery, and threat model are in wire.go.
+// Version 1 encrypts URL delivery but does not authenticate device identities.
+// No security-code exchange is implemented; a hostile LAN participant can race
+// an honest approver. Wire layouts are documented in wire.go.
 package loginbeacon
 
 import (
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	"golang.org/x/net/ipv4"
+	"tailscale.com/feature/loginbeacon/api"
 	"tailscale.com/types/logger"
 )
 
@@ -38,14 +41,17 @@ const MulticastPort = 41421
 
 const beaconInterval = 5 * time.Second
 
+// approvalWindow bounds exclusive handling, not the validity of a delivered URL.
+const approvalWindow = 60 * time.Second
+
 type Config struct {
 	Hostname   string
 	DeviceKind string
 	DeviceID   string
 	AuthURL    func() string
-	// OnApproved fires once when the sender has sealed the auth URL to a
-	// valid approver. approverName is untrusted (empty or "localhost"
-	// possible); callers must sanitize before display.
+	// OnApproved fires after the first clean URL send in each handling window. It
+	// does not prove receipt or authenticate the approver. approverName is
+	// untrusted (empty or "localhost" possible); sanitize before display.
 	OnApproved func(approverName string)
 	Logf       logger.Logf
 }
@@ -62,11 +68,15 @@ type Sender struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu           sync.Mutex
-	sessURL      string
-	sessRID      requestID
-	sessKey      ephemeralKey
-	approvedRIDs map[requestID]bool
+	mu               sync.Mutex
+	sessURL          string
+	sessRID          requestID
+	sessKey          ephemeralKey
+	sessExpires      time.Time
+	approverPub      [32]byte
+	sealedReply      []byte // retransmitted only to the selected approver key
+	approvalNotified bool
+	resumeAt         time.Time // zero while the selected response has not been sent
 }
 
 func Start(ctx context.Context, cfg Config) (*Sender, error) {
@@ -104,15 +114,14 @@ func Start(ctx context.Context, cfg Config) (*Sender, error) {
 
 	sctx, cancel := context.WithCancel(ctx)
 	s := &Sender{
-		cfg:          cfg,
-		conn:         conn,
-		pc:           pc,
-		dst:          &net.UDPAddr{IP: MulticastGroup, Port: MulticastPort},
-		deviceID:     hashDeviceID(cfg.DeviceID),
-		outIface:     ifaceName(outIface),
-		ctx:          sctx,
-		cancel:       cancel,
-		approvedRIDs: make(map[requestID]bool),
+		cfg:      cfg,
+		conn:     conn,
+		pc:       pc,
+		dst:      &net.UDPAddr{IP: MulticastGroup, Port: MulticastPort},
+		deviceID: hashDeviceID(cfg.DeviceID),
+		outIface: ifaceName(outIface),
+		ctx:      sctx,
+		cancel:   cancel,
 	}
 	s.wg.Add(2)
 	go s.sendLoop()
@@ -129,6 +138,7 @@ func (s *Sender) Stop() {
 	s.mu.Lock()
 	s.sessKey.zero()
 	s.sessURL = ""
+	s.sealedReply = nil
 	s.mu.Unlock()
 }
 
@@ -155,6 +165,7 @@ func (s *Sender) tick() {
 		if s.sessURL != "" {
 			s.sessKey.zero()
 			s.sessURL = ""
+			s.sealedReply = nil
 		}
 		s.mu.Unlock()
 		return
@@ -165,9 +176,18 @@ func (s *Sender) tick() {
 		s.cfg.Logf("loginbeacon: session start: %v", err)
 		return
 	}
+	if m == nil {
+		return
+	} // the request is paused or expired
 	pkt, err := marshalBeacon(m)
 	if err != nil {
 		s.cfg.Logf("loginbeacon: marshal beacon: %v", err)
+		return
+	}
+	// Serialize the final eligibility check and send with recipient selection.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sealedReply != nil || s.sessRID != m.RequestID {
 		return
 	}
 	if _, err := s.conn.WriteToUDP(pkt, s.dst); err != nil {
@@ -251,9 +271,29 @@ func (s *Sender) getOrStartSession(url string) (*beaconMsg, error) {
 		s.sessRID = rid
 		s.sessKey = k
 		s.sessURL = url
+		s.sessExpires = time.Now().Add(api.RequestRetention)
+		s.approverPub = [32]byte{}
+		s.sealedReply = nil
+		s.approvalNotified = false
+		s.resumeAt = time.Time{}
 		s.cfg.Logf("loginbeacon: new session rid=%x", rid[:4])
 	}
 
+	if !time.Now().Before(s.sessExpires) {
+		s.sessKey.zero()
+		s.sealedReply = nil
+		return nil, nil
+	}
+	if s.sealedReply != nil {
+		// Only a broadcast tick reopens approval, including after a send error.
+		if s.resumeAt.IsZero() || time.Now().Before(s.resumeAt) {
+			return nil, nil
+		}
+		s.approverPub = [32]byte{}
+		s.sealedReply = nil
+		s.approvalNotified = false
+		s.resumeAt = time.Time{}
+	}
 	return &beaconMsg{
 		RequestID:    s.sessRID,
 		SenderEphPub: s.sessKey.pub,
@@ -266,7 +306,7 @@ func (s *Sender) getOrStartSession(url string) (*beaconMsg, error) {
 
 func (s *Sender) recvLoop() {
 	defer s.wg.Done()
-	buf := make([]byte, maxWireSize)
+	buf := make([]byte, maxWireSize+1)
 	for {
 		n, src, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -274,6 +314,9 @@ func (s *Sender) recvLoop() {
 				return
 			}
 			s.cfg.Logf("loginbeacon: read: %v", err)
+			continue
+		}
+		if n > maxWireSize {
 			continue
 		}
 		s.handlePacket(buf[:n], src)
@@ -298,40 +341,78 @@ func (s *Sender) handlePacket(pkt []byte, src *net.UDPAddr) {
 		return
 	}
 
+	response, err := s.approvalResponse(m)
+	if err != nil {
+		s.cfg.Logf("loginbeacon: approval rejected: %v", err)
+		return
+	}
+	if response == nil {
+		return
+	}
+	// A clean UDP write does not prove delivery. Keep retries to the selected
+	// key available, without extending its handling window on retransmission.
+	currentURL := s.cfg.AuthURL()
 	s.mu.Lock()
-	if s.sessURL == "" || s.sessRID != rid {
+	if currentURL == "" || currentURL != s.sessURL || s.sessRID != rid || s.approverPub != m.ApproverEphPub {
 		s.mu.Unlock()
 		return
 	}
-	if s.approvedRIDs[rid] {
-		// SECURITY: first-approval-wins per session. Anyone on the LAN who
-		// sees the beacon can race to send a fake approval; if the honest
-		// approver wins, this fake is dropped. If the attacker wins, the
-		// honest approver never gets a decryptable URL and the user retries.
-		s.mu.Unlock()
-		return
-	}
-	url := s.sessURL
-	priv := s.sessKey.priv
-	s.approvedRIDs[rid] = true
+	_, sendErr := s.conn.WriteToUDP(response, src)
+	notify := s.finishSendLocked(time.Now(), sendErr)
 	s.mu.Unlock()
-
-	sealed, err := sealURL(priv, m.ApproverEphPub, rid, url)
-	if err != nil {
-		s.cfg.Logf("loginbeacon: seal url: %v", err)
+	if sendErr != nil {
+		s.cfg.Logf("loginbeacon: send sealed url: %v", sendErr)
 		return
 	}
-	pkt2, err := marshalSealedURL(sealed)
-	if err != nil {
-		s.cfg.Logf("loginbeacon: marshal sealed: %v", err)
-		return
-	}
-	if _, err := s.conn.WriteToUDP(pkt2, src); err != nil {
-		s.cfg.Logf("loginbeacon: send sealed url: %v", err)
-		return
-	}
-	s.cfg.Logf("loginbeacon: sent sealed url to %s (rid=%x approver=%q)", src, rid[:4], m.ApproverName)
-	if s.cfg.OnApproved != nil {
+	if notify && s.cfg.OnApproved != nil {
 		s.cfg.OnApproved(m.ApproverName)
 	}
+}
+
+// approvalResponse validates and seals before selecting an approver. A malformed
+// key must not consume the session. Reusing the sealed bytes permits packet-loss
+// retries to the same key without releasing the URL to another approver.
+// This remains unauthenticated: a security-code exchange is still required to
+// protect against an active LAN participant winning the initial approval race.
+func (s *Sender) approvalResponse(m *approvalMsg) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessURL == "" || s.sessRID != m.RequestID || !time.Now().Before(s.sessExpires) {
+		return nil, nil
+	}
+	if s.sealedReply != nil {
+		if (!s.resumeAt.IsZero() && !time.Now().Before(s.resumeAt)) || s.approverPub != m.ApproverEphPub {
+			return nil, nil
+		}
+		return s.sealedReply, nil
+	}
+	sealed, err := sealURL(s.sessKey.priv, m.ApproverEphPub, m.RequestID, s.sessURL)
+	if err != nil {
+		return nil, err
+	}
+	response, err := marshalSealedURL(sealed)
+	if err != nil {
+		return nil, err
+	}
+	s.approverPub = m.ApproverEphPub
+	s.sealedReply = response
+	return response, nil
+}
+
+// finishSendLocked is called with mu held after attempting URL transmission.
+// Even failed sends remain paused until the next broadcast tick.
+func (s *Sender) finishSendLocked(now time.Time, err error) (notify bool) {
+	if err != nil {
+		// Do not release a successful claim because a later retry failed.
+		if !s.approvalNotified {
+			s.resumeAt = now
+		}
+		return false
+	}
+	if s.approvalNotified {
+		return false
+	}
+	s.resumeAt = now.Add(approvalWindow)
+	s.approvalNotified = true
+	return true
 }
