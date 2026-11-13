@@ -413,6 +413,12 @@ func (c *Conn) derpWriteChanForRegion(regionID tailcfg.DERPRegionID, peer key.No
 		}
 		return derpMap.Regions[regionID]
 	})
+	if localAddr := debugDERPCloudflareLocalAddr(); localAddr != "" {
+		dc.SetDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", localAddr)
+		})
+		c.logf("magicsock: routing DERP TCP connections through local Cloudflare Access listener %q", localAddr)
+	}
 	dc.HealthTracker = c.health
 	dc.AppName = c.derpAppName
 	if c.extraRootCAs != nil {

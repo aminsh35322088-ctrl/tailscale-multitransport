@@ -607,6 +607,13 @@ func (c *Client) SetURLDialer(dialer netx.DialFunc) {
 	c.dialer = dialer
 }
 
+// SetDialer sets the network dialer used for DERP connections. Unlike
+// SetURLDialer, it also applies to clients created by NewRegionClient.
+// It must be called before the first connection attempt.
+func (c *Client) SetDialer(dialer netx.DialFunc) {
+	c.dialer = dialer
+}
+
 func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
 	host := c.url.Hostname()
 	if c.dialer != nil {
@@ -715,6 +722,9 @@ func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tl
 }
 
 func (c *Client) dialContext(ctx context.Context, proto, addr string) (net.Conn, error) {
+	if c.dialer != nil {
+		return c.dialer(ctx, proto, addr)
+	}
 	return netns.NewDialer(c.logf, c.netMon).DialContext(ctx, proto, addr)
 }
 
